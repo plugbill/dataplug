@@ -1,0 +1,101 @@
+name: Build DataPlug release APK + AAB (Play Store)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Unique, always-rising version code for every build (Play rejects repeats). Raise 100 if Play says it is too low.
+      VERSION_CODE: ${{ github.run_number }}00
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works in both layouts: repo contains dataplug_app.zip, OR the project is extracted in the repo root.
+      - name: Locate the project
+        run: |
+          if [ -f dataplug_app.zip ]; then unzip -q dataplug_app.zip -d _project; fi
+          SETTINGS=$(find . -name settings.gradle.kts | head -1)
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Build signed APK and AAB
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleRelease bundleRelease --no-daemon
+
+      - name: Verify both files are signed with the permanent key
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          WANT=$(tr -d ':\n ' < EXPECTED_SHA256.txt | tr 'a-f' 'A-F')
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" > apk-certs.txt
+          GOT_APK=$(grep "SHA-256 digest" apk-certs.txt | head -1 | sed 's/.*: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          GOT_AAB=$(keytool -printcert -jarfile "$AAB" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          echo "Expected $WANT"; echo "APK      $GOT_APK"; echo "AAB      $GOT_AAB"
+          [ "$GOT_APK" = "$WANT" ] || { echo "::error::APK is NOT signed with the permanent key"; exit 1; }
+          [ "$GOT_AAB" = "$WANT" ] || { echo "::error::AAB is NOT signed with the permanent key"; exit 1; }
+          echo "versionCode used: $VERSION_CODE"
+
+      - name: Verify Play Store requirements (APK + AAB)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          # ---- APK: package, SDK levels, not debuggable
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -E "^package:|dkVersion|application-debuggable" badging.txt || true
+          # applicationId is com.dataplug.vtu.app (must match google-services.json and the Play listing)
+          grep -q "name='com.dataplug.vtu.app'" badging.txt || { echo "::error::Wrong package name"; exit 1; }
+          grep -qE "^(sdkVersion|minSdkVersion):'24'" badging.txt || { echo "::error::APK minSdk is not 24 (Android 7)"; exit 1; }
+          TARGET=$(grep "^targetSdkVersion" badging.txt | sed "s/[^0-9]//g")
+          [ "$TARGET" -ge 36 ] || { echo "::error::APK targetSdk is $TARGET, Play needs 36+"; exit 1; }
+          ! grep -q "application-debuggable" badging.txt || { echo "::error::APK is debuggable - Play rejects this"; exit 1; }
+          # ---- AAB: structure + manifest checks with Google's own bundletool
+          curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar
+          java -jar bundletool.jar validate --bundle="$AAB"
+          MINSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:minSdkVersion)
+          TGTSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:targetSdkVersion)
+          echo "AAB minSdk=$MINSDK targetSdk=$TGTSDK"
+          [ "$MINSDK" = "24" ] || { echo "::error::AAB minSdk is $MINSDK, expected 24"; exit 1; }
+          [ "$TGTSDK" -ge 36 ] || { echo "::error::AAB targetSdk is $TGTSDK, Play needs 36+"; exit 1; }
+          DEBUGGABLE=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/application/@android:debuggable 2>/dev/null || true)
+          [ "$DEBUGGABLE" != "true" ] || { echo "::error::AAB is debuggable - Play rejects this"; exit 1; }
+          jarsigner -verify "$AAB" | head -3
+          echo "All Play Store checks passed."
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataPlug-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+
+      - name: Upload AAB (for Google Play)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataPlug-AAB-for-PlayStore
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/bundle/release/*.aab
+
+      - name: Upload R8 mapping (deobfuscation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataPlug-mapping
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/mapping/release/mapping.txt
